@@ -1,42 +1,29 @@
 #!/usr/bin/env bash
 #
-# Runs the benchmark campaign and collects timing, memory, CPU and I/O metrics into
-# $RESULTS/raw.jsonl, then draws the plots. Two datasets, same experiments:
+# Runs the benchmark measurements behind the thesis and collects timing, memory, CPU and I/O
+# metrics into $RESULTS/raw.jsonl, then runs plot_results.py. Two datasets:
 #
-#   DATASET=synthetic (default)  the ds_x1..ds_x32 series: N copies of examples/test.root
-#   DATASET=real                 Tier0 NanoAOD as .txt file lists from archive/make_filelists.py
-#   DATASET=big                  ~1 TB: ds_1..ds_96.root, plain copies of ds_x32.root from
-#                                archive/make_bigset.sh, one repeat each, read cold (COLD=1); T1/T2 on
-#                                up to 1 TB, T4 on ~100 GB and the size series (TESTS)
+#   DATASET=big (default)  ds_1..ds_96.root, plain copies of ds_x32.root in DATA_DIR, read cold
+#                          (COLD=1), one repeat each: Block A (qstruct, size, sizepy) and the
+#                          file-width control (strong11, on the full copies or on the slim set)
+#   DATASET=real           the Run 3 NanoAOD files: core.txt or wildcard patterns in DS_CORE
+#                          (slurm_run3.sbatch): Block F (strong11) and Block N (node11)
 #
-# TESTS selects the experiments; ONLY_USED=1 additionally drops the implementations no figure
-# uses. Both default per dataset, see below.
-#
-#   T1  strong scaling   core input (ds_x32 / core.txt), thread count varying  -> Amdahl
-#   T2  weak scaling     N threads on N units of work (ds_xN / weak_N.txt)
-#   T4  query structure  lazy / eager / Report() x chain length  (single thread, impl input)
-#   T5  implementations  RDataFrame / correctionlib / Python / uproot on the impl input,
-#                        pinned to one core (PIN_CORE)
-#   T6  file width       T1 again on the slim copy of the core input: 6 columns, same events
-#   T2S weak on slim     T2 again on slim copies of the weak inputs
-#   size / sizepy        T5 against input size (DATASET=big only): RDataFrame and uproot, and
-#                        separately Python, pinned to one core on 1..9 copies (~11-98 GB)
-#   node11               the 11-filter chain on the whole node and the whole core input:
-#                        RDataFrame on NODE_THREADS threads, uproot and Python in a pool of
-#                        NODE_THREADS processes (bench_pool.py)
-#
-# T3 is memory and has no runs of its own: every run writes an RSS trace and a peak.
-# T1 and T6 include t0, ImplicitMT off, so speedup can be quoted against the fastest serial
-# run as well as against ImplicitMT(1).
+# TESTS selects the experiments, in the order below; names are the ones in the labels:
+#   strong11  thread sweep of the 11-filter chain (bench_chain --chain long) on the core input
+#   node11    the same chain on the whole node: RDataFrame on NODE_THREADS threads, uproot and
+#             Python in a pool of NODE_THREADS processes (bench_pool.py)
+#   qstruct   lazy vs eager vs Report() x chain length, 1 thread (DATASET=big, ~100 GB impl input)
+#   size      RDataFrame and uproot pinned to one core on 1..9 copies (DATASET=big)
+#   sizepy    Python on the same points, smallest first (DATASET=big)
 #
 # Each measurement runs in its own process, so the cling JIT cost cannot be amortised across
 # repeats; the benchmarks move it into their own "setup"/"jit" phases instead, and only "loop"
 # is comparable between implementations.
 #
 # Usage:
-#   MACHINE=ares DATA_DIR=$SCRATCH/bench/data ./test/run_benchmark.sh
-#   MACHINE=ares DATASET=real DATA_DIR=$SCRATCH/bench/real ./test/run_benchmark.sh
-#   MACHINE=ares DATASET=big  DATA_DIR=$SCRATCH/bench/data ./test/run_benchmark.sh
+#   MACHINE=ares DATASET=big DATA_DIR=$SCRATCH/bench/data ./test/run_benchmark.sh
+#   DATASET=real TESTS=node11 DATA_DIR=$SCRATCH/bench/data3 ./test/run_benchmark.sh
 #   DRY_RUN=1 ./test/run_benchmark.sh    # list the runs without executing them
 #
 # RESUME=1 appends to an existing $RESULTS/raw.jsonl and skips every label already recorded
@@ -58,78 +45,53 @@ PY="${PY:-python3}"
 RESULTS="${RESULTS:-$TEST_DIR/results}"
 DATA_DIR="${DATA_DIR:-$TEST_DIR/data}"
 MACHINE="${MACHINE:-local}"
-# 12 and 24 are not decoration: the optimum fit needs points either side of the maximum, and with only
-# powers of two the region where the curve turns over is three points.
 THREADS_LIST="${THREADS_LIST:-1 2 4 8 12 16 24 32 48}"
 CHAIN_LENS="${CHAIN_LENS:-1 3 5}"
 
-# DATASET=big is one pass over ~1 TB rather than a campaign that can afford repeats: a single
-# strong-scaling sweep there is already ~2 h. It also defaults to cold reads (see COLD below)
-# and to the variants the thesis actually plots (ONLY_USED).
-DATASET="${DATASET:-synthetic}"
-if [[ "$DATASET" == big ]]; then
-    REPEATS_STRONG="${REPEATS_STRONG:-1}"
-    REPEATS_WEAK="${REPEATS_WEAK:-1}"
-    REPEATS_QSTRUCT="${REPEATS_QSTRUCT:-1}"
-    REPEATS_IMPL="${REPEATS_IMPL:-1}"
-    REPEATS_SLIM="${REPEATS_SLIM:-1}"
-    COLD="${COLD:-1}"
-    ONLY_USED="${ONLY_USED:-1}"
-    # Only what ds_x32 could not answer:
-    #   strong, weak  on up to the whole 1 TB;
-    #   qstruct  on impl.txt, ~100 GB: rdf-eager reads its input up to six times, which on the
-    #            whole set would be 6 TB;
-    #   size     T5 as a series of sizes instead of one input: the Python and uproot paths
-    #            materialise whole columns, so on 1 TB they would die on memory;
-    #   sizepy   the Python half of that series, ~9 h and the only runs that can run out of
-    #            memory, so it is a second job (TESTS=sizepy RESUME=1) rather than part of this.
-    # slim and weakslim, the file-width experiment, do not depend on the input size.
-    TESTS="${TESTS:-strong weak qstruct size}"
-fi
-# Copies per point of the size and sizepy series (DATASET=big).
+DATASET="${DATASET:-big}"
+case "$DATASET" in
+    big)
+        # One pass over ~1 TB rather than a campaign that can afford repeats.
+        REPEATS_QSTRUCT="${REPEATS_QSTRUCT:-1}"
+        COLD="${COLD:-1}"
+        #   qstruct  on impl.txt, ~100 GB: rdf-eager reads its input up to six times, which on the
+        #            whole set would be 6 TB;
+        #   size     the implementations as a series of sizes: the Python and uproot paths
+        #            materialise whole columns, so on 1 TB they would die on memory;
+        #   sizepy   the Python half of that series, ~9 h and the only runs that can run out of
+        #            memory, so it is a second job (TESTS=sizepy RESUME=1) rather than part of this.
+        TESTS="${TESTS:-qstruct size}"
+        ;;
+    real)
+        TESTS="${TESTS:-strong11}"
+        ;;
+    *)
+        echo "ERROR: DATASET must be 'big' or 'real', not '$DATASET'" >&2
+        exit 1
+        ;;
+esac
+# Copies per point of the size and sizepy series.
 SIZE_SERIES="${SIZE_SERIES:-1 2 4 6 8 9}"
 RESUME="${RESUME:-}"
 # The discarded warm-up runs absorb the first process's cold ROOT libraries. Without them that
-# cost lands on the first measured run (r1_strong_filter_rdf_t0).
+# cost lands on the first measured run.
 WARMUP_RUNS="${WARMUP_RUNS:-1}"
-REPEATS_STRONG="${REPEATS_STRONG:-5}"
-REPEATS_WEAK="${REPEATS_WEAK:-3}"
 REPEATS_QSTRUCT="${REPEATS_QSTRUCT:-2}"
-REPEATS_IMPL="${REPEATS_IMPL:-3}"
-REPEATS_SLIM="${REPEATS_SLIM:-3}"
-# T5 compares implementations on one core. uproot starts its own threads however its executors
-# are set (442-444% CPU on Ares with TrivialExecutor), so the core is enforced from outside.
+# The single-core series compares implementations on one core. uproot starts its own threads
+# however its executors are set (442-444% CPU on Ares with TrivialExecutor), so the core is
+# enforced from outside.
 PIN_CORE="${PIN_CORE:-2}"
-# The Python chain on ds_x32 needs ~1100 s. A timeout does not slow anything down -- it only
-# decides whether a slow run is recorded or thrown away.
+# A timeout does not slow anything down -- it only decides whether a slow run is recorded or
+# thrown away.
 RUN_TIMEOUT="${RUN_TIMEOUT:-2400}"
 SAMPLE_INTERVAL="${SAMPLE_INTERVAL:-0.1}"
 # COLD=1 drops the inputs' pages from the page cache before every run, so each run reads them
-# from the file system instead of from RAM. Only meaningful on a set of distinct files: see
-# archive/make_bigset.sh for why the 1 TB input is copies rather than one file named many times.
+# from the file system instead of from RAM. Only meaningful on a set of distinct files: the
+# 1 TB input is copies rather than one file named many times, which would be read from the
+# page cache after the first time.
 COLD="${COLD:-}"
-# ONLY_USED=1 runs just the implementations that end up in a figure or a number in the thesis.
-ONLY_USED="${ONLY_USED:-}"
-# Which experiments to run, in the order below. Names are the ones that appear in the labels:
-#   strong    T1  thread sweep on the core input        -> Amdahl, efficiency, RSS, cores
-#   weak      T2  N threads on N units of work
-#   qstruct   T4  lazy vs eager vs Report(), 1 thread
-#   impl      T5  RDataFrame vs Python vs uproot, pinned to one core
-#   slim      T6  T1 again on the 6-column copy         -> where the ceiling comes from
-#   weakslim  T2S T2 again on the 6-column copies
-#   size      T5's RDataFrame and uproot runs on each point of SIZE_SERIES (DATASET=big)
-#   sizepy    T5's Python runs on the same points, smallest first (DATASET=big)
-#   strong11  T1 for the 11-filter chain alone (bench_chain --chain long): on the slim set
-#             whose files hold just its 10 branches (DATASET=big, DATA_DIR=<slim set>), or on
-#             full real files (DATASET=real, the Run 3 campaign)
-#   weak11    T2 for the same chain on the same set
-#   node11    RDataFrame, uproot and Python on the whole core input, each with the whole node
-#             (NODE_IMPLS x NODE_THREADS)
-#   strongchain  T1 for the 5-filter chain alone, no t0, with $CHAIN_ARGS: the comparison of
-#             the real Open Data set against the artificial one (archive/slurm_real_vs_synthetic.sbatch)
-TESTS="${TESTS:-strong weak qstruct impl slim weakslim}"
-# Extra bench_chain.py arguments for strongchain, strong11, weak11, node11 and the chain11
-# warm-up, e.g. "--period 2016" on Run 2 data.
+# Extra bench_chain.py (and bench_pool.py) arguments for strong11, node11 and the chain11
+# warm-up, e.g. "--period run3".
 CHAIN_ARGS="${CHAIN_ARGS:-}"
 read -r -a chain_args <<< "$CHAIN_ARGS"
 
@@ -139,16 +101,10 @@ has_test() {
 }
 for requested in $TESTS; do
     case "$requested" in
-        strong|weak|qstruct|impl|slim|weakslim|strongchain) ;;
-        size|sizepy)
+        strong11|node11) ;;
+        qstruct|size|sizepy)
             if [[ "$DATASET" != big ]]; then
                 echo "ERROR: TESTS=$requested needs DATASET=big (the ds_N.root copies)." >&2
-                exit 1
-            fi
-            ;;
-        strong11|weak11|node11)
-            if [[ "$DATASET" == synthetic ]]; then
-                echo "ERROR: TESTS=$requested needs DATASET=big or DATASET=real." >&2
                 exit 1
             fi
             ;;
@@ -156,14 +112,11 @@ for requested in $TESTS; do
     esac
 done
 
-# The slim set holds only the 11-filter chain's branches, so nothing else can run on it: the
-# 5-filter chain and the filter would, but they are measured on the full files, and the
-# efficiency column's x/y are not there at all. A Run 3 campaign of the chain alone skips the
-# other warm-ups for the same reason it skips the other tests.
+# The slim set holds only the 11-filter chain's branches, so nothing else can run on it, and a
+# Run 3 campaign of the chain alone skips the other warm-ups for the same reason.
 ONLY_CHAIN11=1
 for requested in $TESTS; do
-    [[ "$requested" == strong11 || "$requested" == weak11 || "$requested" == node11 ]] \
-        || ONLY_CHAIN11=""
+    [[ "$requested" == strong11 || "$requested" == node11 ]] || ONLY_CHAIN11=""
 done
 # node11: what runs, and with how many threads (RDataFrame) or processes (the pools).
 NODE_IMPLS="${NODE_IMPLS:-rdf-lazy uproot-pool python-pool}"
@@ -177,97 +130,36 @@ for impl in $NODE_IMPLS; do
         *) echo "ERROR: NODE_IMPLS: unknown implementation '$impl'." >&2; exit 1 ;;
     esac
 done
-# T1 for the long chain: no t0 (its ImplicitMT(1) penalty is measured on the full files) and no
-# t2, which on 1 TB costs half a t1. STRONG11_R2_THREADS are measured a second time, after the
-# whole first sweep, so the repeat sees the node at a different moment. STRONG11_R3_THREADS
-# give a third run where the first two disagree, so the median no longer averages an outlier.
-# STRONG11_R4_THREADS give a fourth where two of three runs were slowed down.
+# The strong11 sweep: no t0 and no t2, which on 1 TB costs half a t1. STRONG11_R2_THREADS are
+# measured a second time, after the whole first sweep, so the repeat sees the node at a
+# different moment. STRONG11_R3_THREADS give a third run where the first two disagree, so the
+# median no longer averages an outlier. STRONG11_R4_THREADS give a fourth where two of three
+# runs were slowed down.
 STRONG11_THREADS="${STRONG11_THREADS:-$(for t in $THREADS_LIST; do
     [[ "$t" == 0 || "$t" == 2 ]] || printf '%s ' "$t"; done)}"
 STRONG11_R2_THREADS="${STRONG11_R2_THREADS:-}"
 STRONG11_R3_THREADS="${STRONG11_R3_THREADS:-}"
 STRONG11_R4_THREADS="${STRONG11_R4_THREADS:-}"
-# Further whole sweeps, one per repeat number (e.g. "5 6"), over STRONG11_EXTRA_THREADS. Every
-# second sweep runs in reverse: file-system slowdowns come in waves of consecutive runs, and the
-# reversed order keeps one wave from hitting the same thread counts in both sweeps.
-STRONG11_EXTRA_REPEATS="${STRONG11_EXTRA_REPEATS:-}"
-STRONG11_EXTRA_THREADS="${STRONG11_EXTRA_THREADS:-}"
-# The same for weak11: points of WEAK_SERIES measured once more, labelled r3.
-WEAK11_R3_SERIES="${WEAK11_R3_SERIES:-}"
 
-# Inputs are a .root file or a .txt list of them; every benchmark accepts both. Each variable
-# can still be overridden on its own.
-case "$DATASET" in
-    synthetic)
-        DS_CORE="${DS_CORE:-$DATA_DIR/ds_x32.root}"
-        DS_IMPL="${DS_IMPL:-$DS_CORE}"
-        DS_SLIM="${DS_SLIM:-$DATA_DIR/ds_x32_slim.root}"
-        # Clusters per thread are flat to 1% across ds_x1..ds_x32.
-        WEAK_PATTERN="${WEAK_PATTERN:-ds_x%s.root}"
-        WEAK_SLIM_PATTERN="${WEAK_SLIM_PATTERN:-ds_x%s_slim.root}"
-        WEAK_SERIES="${WEAK_SERIES:-1 2 4 8 16 32}"
-        ;;
-    real)
-        DS_CORE="${DS_CORE:-$DATA_DIR/core.txt}"
-        # ~11 M events, the size of ds_x32: the Python chain alone is ~20 min there.
-        DS_IMPL="${DS_IMPL:-$DATA_DIR/impl.txt}"
-        DS_SLIM="${DS_SLIM:-$DATA_DIR/core_slim.txt}"
-        # archive/make_filelists.py sizes weak_N to N x (core events / 48); sets.json has the deviations.
-        WEAK_PATTERN="${WEAK_PATTERN:-weak_%s.txt}"
-        # weak_N lists are subsets of core, so their slim files already exist in slim/.
-        WEAK_SLIM_PATTERN="${WEAK_SLIM_PATTERN:-weak_%s_slim.txt}"
-        WEAK_SERIES="${WEAK_SERIES:-1 2 4 8 16 32 48}"
-        ;;
-    big)
-        # ds_1.root .. ds_$BIG_COPIES.root in DATA_DIR, from archive/make_bigset.sh. The lists over
-        # them are written below into lists/, so the layout is the same as `real` and nothing
-        # further down has to know which of the two it is running on.
-        # The slim set's build job writes copies.txt: its count comes from a measurement.
-        BIG_COPIES="${BIG_COPIES:-$(cat "$DATA_DIR/copies.txt" 2>/dev/null || echo 96)}"
-        # T4's input: rdf-eager reads it up to six times, which on the whole set would be 6 TB.
-        IMPL_COPIES="${IMPL_COPIES:-9}"
-        DS_CORE="${DS_CORE:-$DATA_DIR/lists/core.txt}"
-        DS_IMPL="${DS_IMPL:-$DATA_DIR/lists/impl.txt}"
-        DS_SLIM="${DS_SLIM:-$DATA_DIR/lists/core_slim.txt}"
-        WEAK_PATTERN="${WEAK_PATTERN:-lists/weak_%s.txt}"
-        WEAK_SLIM_PATTERN="${WEAK_SLIM_PATTERN:-lists/weak_%s_slim.txt}"
-        SIZE_PATTERN="${SIZE_PATTERN:-lists/size_%s.txt}"
-        WEAK_SERIES="${WEAK_SERIES:-1 2 4 8 16 32 48}"
-        # Copies per thread at each weak point. 2 on Ares, where 48 threads x 2 is the whole
-        # set; 1 on Helios, where 96 threads x 1 is, and 192 threads at 2 would need 4 TB.
-        WEAK_UNIT="${WEAK_UNIT:-2}"
-        if has_test slim || has_test weakslim; then
-            echo "ERROR: DATASET=big has no slim copies; TESTS=slim/weakslim run on ds_x32." >&2
+# Inputs are a .root file, a .txt list of them or space-separated wildcard patterns; every
+# benchmark accepts all three. Each variable can still be overridden on its own.
+if [[ "$DATASET" == real ]]; then
+    DS_CORE="${DS_CORE:-$DATA_DIR/core.txt}"
+else
+    # ds_1.root .. ds_$BIG_COPIES.root in DATA_DIR. The lists over them are written below into
+    # lists/. The slim set's build job wrote copies.txt: its count came from a measurement.
+    BIG_COPIES="${BIG_COPIES:-$(cat "$DATA_DIR/copies.txt" 2>/dev/null || echo 96)}"
+    IMPL_COPIES="${IMPL_COPIES:-9}"
+    DS_CORE="${DS_CORE:-$DATA_DIR/lists/core.txt}"
+    DS_IMPL="${DS_IMPL:-$DATA_DIR/lists/impl.txt}"
+    SIZE_PATTERN="${SIZE_PATTERN:-lists/size_%s.txt}"
+    for n in $IMPL_COPIES $SIZE_SERIES; do
+        if [[ "$n" -gt "$BIG_COPIES" ]]; then
+            echo "ERROR: $n copies asked for, BIG_COPIES is $BIG_COPIES." >&2
             exit 1
         fi
-        # WEAK_UNIT x N distinct copies at N threads: without them the largest weak points
-        # would reuse files and stop being a weak-scaling series.
-        for n in $WEAK_SERIES; do
-            if [[ $((WEAK_UNIT * n)) -gt "$BIG_COPIES" ]]; then
-                echo "ERROR: weak point $n needs $((WEAK_UNIT * n)) copies, BIG_COPIES is $BIG_COPIES." >&2
-                exit 1
-            fi
-        done
-        for n in $IMPL_COPIES $SIZE_SERIES; do
-            if [[ "$n" -gt "$BIG_COPIES" ]]; then
-                echo "ERROR: $n copies asked for, BIG_COPIES is $BIG_COPIES." >&2
-                exit 1
-            fi
-        done
-        ;;
-    *)
-        echo "ERROR: DATASET must be 'synthetic', 'real' or 'big', not '$DATASET'" >&2
-        exit 1
-        ;;
-esac
-
-weak_input() {
-    printf "%s/${WEAK_PATTERN}" "$DATA_DIR" "$1"
-}
-
-weak_slim_input() {
-    printf "%s/${WEAK_SLIM_PATTERN}" "$DATA_DIR" "$1"
-}
+    done
+fi
 
 size_input() {
     printf "%s/${SIZE_PATTERN:-}" "$DATA_DIR" "$1"
@@ -288,13 +180,10 @@ if [[ "$DATASET" == big && -z "${DRY_RUN:-}" ]]; then
     mkdir -p "$DATA_DIR/lists"
     write_big_list core.txt "$BIG_COPIES"
     write_big_list impl.txt "$IMPL_COPIES"
-    for n in $WEAK_SERIES; do
-        write_big_list "weak_${n}.txt" $((WEAK_UNIT * n))
-    done
     for n in $SIZE_SERIES; do
         write_big_list "size_${n}.txt" "$n"
     done
-    echo "lists: $DATA_DIR/lists (core $BIG_COPIES, impl $IMPL_COPIES, weak ${WEAK_UNIT}N, size N copies)"
+    echo "lists: $DATA_DIR/lists (core $BIG_COPIES, impl $IMPL_COPIES, size N copies)"
 fi
 
 # The .root files behind an input: the file itself, the files space-separated wildcard patterns
@@ -364,14 +253,10 @@ if [[ -z "${DRY_RUN:-}" ]] && ! "$PY" -c "import ROOT" 2>/dev/null; then
     exit 1
 fi
 
-# Every experiment needs its files, and a missing weak-scaling point would otherwise just
-# vanish from the curve.
-INPUTS=("$DS_CORE" "$DS_IMPL")
-if has_test weak || has_test weak11 || has_test weakslim; then
-    for n in $WEAK_SERIES; do
-        INPUTS+=("$(weak_input "$n")")
-    done
-fi
+# Every experiment needs its files, and a missing point would otherwise just vanish from the
+# curve.
+INPUTS=("$DS_CORE")
+has_test qstruct && INPUTS+=("$DS_IMPL")
 if has_test size || has_test sizepy; then
     for n in $SIZE_SERIES; do
         INPUTS+=("$(size_input "$n")")
@@ -399,8 +284,8 @@ for input in "${INPUTS[@]}"; do
     done < <(list_files "$input")
 done
 if [[ "$missing" -ne 0 && "$DATASET" == big ]]; then
-    echo "       Make the copies first: bash test/archive/make_bigset.sh --source $DATA_DIR/ds_x32.root" \
-        "--copies $BIG_COPIES" >&2
+    echo "       The input is $BIG_COPIES plain copies of ds_x32.root, ds_1.root .. ds_$BIG_COPIES.root," \
+        "in $DATA_DIR (cp, not hadd: hadd changes the cluster boundaries)." >&2
 fi
 [[ "$missing" -eq 0 || -n "${DRY_RUN:-}" ]] || exit 1
 
@@ -443,10 +328,10 @@ TIMEOUT_BIN="$(command -v timeout || command -v gtimeout || true)"
 
 TASKSET_BIN="$(command -v taskset || true)"
 if [[ -n "$TASKSET_BIN" ]] && ! "$TASKSET_BIN" -c "$PIN_CORE" true 2>/dev/null; then
-    echo "WARNING: cannot pin to core $PIN_CORE; T5 runs unpinned." >&2
+    echo "WARNING: cannot pin to core $PIN_CORE; the single-core series runs unpinned." >&2
     TASKSET_BIN=""
 elif [[ -z "$TASKSET_BIN" && -z "${DRY_RUN:-}" ]]; then
-    echo "WARNING: taskset not found; T5 runs unpinned and uproot may use several cores." >&2
+    echo "WARNING: taskset not found; the single-core series runs unpinned and uproot may use several cores." >&2
 fi
 
 # run_one <label> <script> [args...]
@@ -474,7 +359,7 @@ run_one() {
     fi
 
     # Whatever this run is about to read, minus the page cache. The input is taken from the
-    # run's own --input so that a run on the slim set does not evict the full one.
+    # run's own --input so that a run on one set does not evict another.
     if [[ -n "$COLD" ]]; then
         local -a inputs=()
         local i
@@ -548,33 +433,6 @@ PYEOF
     rm -f "$time_file" "$stdout_file"
 }
 
-# --exclusive reserves the node, not the filesystem: the inputs are tens of GB on shared Lustre,
-# so without this the first run on each file carries a cold read. Reading the whole files
-# (rather than running one benchmark) warms every branch the tests touch. archive/make_slim.py writes
-# through .partial names, so an existing slim input is always a complete one.
-SLIM_INPUTS=()
-if has_test slim || has_test weakslim; then
-    SLIM_INPUTS+=("$DS_SLIM")
-    for n in $WEAK_SERIES; do
-        SLIM_INPUTS+=("$(weak_slim_input "$n")")
-    done
-fi
-if [[ -z "${DRY_RUN:-}" ]] && { has_test slim || has_test weakslim; }; then
-    if [[ ! -f "$DS_SLIM" ]]; then
-        echo "=== writing $(basename "$DS_SLIM") ==="
-        PYTHONPATH="$TEST_DIR${PYTHONPATH:+:$PYTHONPATH}" "$PY" "$TEST_DIR/archive/make_slim.py" \
-            --input "$DS_CORE" --output "$DS_SLIM" || exit 1
-    fi
-    for n in $WEAK_SERIES; do
-        slim_input="$(weak_slim_input "$n")"
-        if [[ ! -f "$slim_input" ]]; then
-            echo "=== writing $(basename "$slim_input") ==="
-            PYTHONPATH="$TEST_DIR${PYTHONPATH:+:$PYTHONPATH}" "$PY" "$TEST_DIR/archive/make_slim.py" \
-                --input "$(weak_input "$n")" --output "$slim_input" || exit 1
-        fi
-    done
-fi
-
 if [[ -z "${DRY_RUN:-}" ]]; then
     # With COLD the next thing run_one does is throw these pages away again, and on the 1 TB
     # set reading everything first would cost ~1 h for nothing. Instead the campaign checks
@@ -598,7 +456,7 @@ if [[ -z "${DRY_RUN:-}" ]]; then
         fi
     else
         echo "=== warming the page cache ==="
-        for input in "${INPUTS[@]}" ${SLIM_INPUTS[@]+"${SLIM_INPUTS[@]}"}; do
+        for input in "${INPUTS[@]}"; do
             list_files "$input"
         done | sort -u | while IFS= read -r file; do
             cat "$file" >/dev/null
@@ -607,9 +465,8 @@ if [[ -z "${DRY_RUN:-}" ]]; then
 fi
 
 # The page cache is not the only cold thing: the first process of the job also loads ROOT's
-# libraries and PCH off Lustre, and in the previous campaign r1_strong_filter_rdf_t1 ran at
-# 69% CPU and 13.9 s against 99% and 9.6 s for the same label later. These runs absorb that
-# and are never plotted (the plots select on the r<N>_ prefix).
+# libraries and PCH off Lustre. These runs absorb that and are never plotted (the plots select
+# on the r<N>_ prefix).
 #
 # Under COLD they run on a single file: what they are for is the libraries and the PCH, and
 # reading 1 TB three times to get them would cost hours.
@@ -624,16 +481,16 @@ if [[ "$WARMUP_RUNS" -eq 1 ]]; then
         run_one "warmup_chain_rdf-lazy" bench_chain.py --input "$WARMUP_INPUT_SET" --impl rdf-lazy
         run_one "warmup_eff_jit" bench_efficiency.py --input "$WARMUP_INPUT_SET" --impl jit
     fi
-    if has_test strong11 || has_test weak11 || has_test node11; then
+    if has_test strong11 || has_test node11; then
         run_one "warmup_chain11_rdf-lazy" bench_chain.py --input "$WARMUP_INPUT_SET" \
             --impl rdf-lazy --chain long ${chain_args[@]+"${chain_args[@]}"}
     fi
 fi
 
-# T1 and T2 for the 11-filter chain on the slim set. Labelled strong_/weak_ like T1 and T2, so
-# the figures pick them up; the test field (chain11) keeps them apart from the 5-filter chain.
+# Strong scaling of the 11-filter chain: Run 3 (Block F), and the full and slim copies of the
+# file-width control.
 if has_test strong11; then
-echo "=== T1 strong scaling, 11-filter chain ${CHAIN_ARGS:+($CHAIN_ARGS) }on $(basename "$DS_CORE"): $STRONG11_THREADS ==="
+echo "=== strong scaling, 11-filter chain ${CHAIN_ARGS:+($CHAIN_ARGS) }on $(basename "$DS_CORE"): $STRONG11_THREADS ==="
 for threads in $STRONG11_THREADS; do
     run_one "r1_strong_chain11_rdf-lazy_t${threads}" bench_chain.py \
         --input "$DS_CORE" --impl rdf-lazy --chain long --threads "$threads" \
@@ -654,45 +511,13 @@ for threads in $STRONG11_R4_THREADS; do
         --input "$DS_CORE" --impl rdf-lazy --chain long --threads "$threads" \
         ${chain_args[@]+"${chain_args[@]}"}
 done
-read -r -a extra_threads <<< "$STRONG11_EXTRA_THREADS"
-sweep=0
-for repeat in $STRONG11_EXTRA_REPEATS; do
-    for ((k = 0; k < ${#extra_threads[@]}; k++)); do
-        if (( sweep % 2 )); then
-            threads="${extra_threads[${#extra_threads[@]} - 1 - k]}"
-        else
-            threads="${extra_threads[k]}"
-        fi
-        run_one "r${repeat}_strong_chain11_rdf-lazy_t${threads}" bench_chain.py \
-            --input "$DS_CORE" --impl rdf-lazy --chain long --threads "$threads" \
-            ${chain_args[@]+"${chain_args[@]}"}
-    done
-    sweep=$((sweep + 1))
-done
 fi
 
-if has_test weak11; then
-echo "=== T2 weak scaling, 11-filter chain: $WEAK_PATTERN on N threads ==="
-for repeat in $(seq 1 "$REPEATS_WEAK"); do
-    for n in $WEAK_SERIES; do
-        run_one "r${repeat}_weak_chain11_rdf-lazy_t${n}" bench_chain.py \
-            --input "$(weak_input "$n")" --impl rdf-lazy --chain long --threads "$n" \
-            ${chain_args[@]+"${chain_args[@]}"}
-    done
-done
-for n in $WEAK11_R3_SERIES; do
-    run_one "r3_weak_chain11_rdf-lazy_t${n}" bench_chain.py \
-        --input "$(weak_input "$n")" --impl rdf-lazy --chain long --threads "$n" \
-        ${chain_args[@]+"${chain_args[@]}"}
-done
-fi
-
-# The whole core input, the whole node, each implementation the way it uses a node: ImplicitMT
-# threads for RDataFrame, a pool of single-threaded processes over the files for uproot and
-# Python. The rdf-lazy run repeats a strong11 point, as a control taken next to the pools.
-# Repeats are the outer loop, so a slow stretch of Lustre lands on every implementation once.
-# A run that hit RUN_TIMEOUT (exit 124, in this job or one before it) is not repeated: the
-# next one would take as long and end the same way.
+# Block N: the whole core input, the whole node, each implementation the way it uses a node:
+# ImplicitMT threads for RDataFrame, a pool of single-threaded processes over the files for
+# uproot and Python. Repeats are the outer loop, so a slow stretch of Lustre lands on every
+# implementation once. A run that hit RUN_TIMEOUT (exit 124, in this job or one before it) is
+# not repeated: the next one would take as long and end the same way.
 node_timed_out() {
     grep -sqE "\"label\":\"r[0-9]+_node_chain11_$1_t$2\",\"status\":\"failed\",\"exit_code\":124," \
         "$RAW"
@@ -721,57 +546,10 @@ for repeat in $(seq 1 "$REPEATS_NODE"); do
 done
 fi
 
-# T1: the same events every time, thread count varying. Repeats are the outer loop so that
-# slow drift on the node spreads across thread counts instead of landing on one of them.
-if has_test strong; then
-    echo "=== T1 strong scaling on $(basename "$DS_CORE") ==="
-    for repeat in $(seq 1 "$REPEATS_STRONG"); do
-    for threads in 0 $THREADS_LIST; do
-            run_one "r${repeat}_strong_filter_rdf_t${threads}" bench_filter.py \
-                --input "$DS_CORE" --impl rdf --threads "$threads"
-            run_one "r${repeat}_strong_chain_rdf-lazy_t${threads}" bench_chain.py \
-            --input "$DS_CORE" --impl rdf-lazy --threads "$threads"
-            run_one "r${repeat}_strong_eff_jit_t${threads}" bench_efficiency.py \
-                --input "$DS_CORE" --impl jit --threads "$threads"
-        done
-    done
-fi
-
-# T1 for the chain alone, labelled like T1's chain runs so the same plots read it. No t0: the
-# ImplicitMT(1) penalty is already measured on the artificial set.
-if has_test strongchain; then
-    echo "=== T1 strong scaling, 5-filter chain ${CHAIN_ARGS:+($CHAIN_ARGS) }on $(basename "$DS_CORE") ==="
-    for repeat in $(seq 1 "$REPEATS_STRONG"); do
-        for threads in $THREADS_LIST; do
-            [[ "$threads" == 0 ]] && continue
-            run_one "r${repeat}_strong_chain_rdf-lazy_t${threads}" bench_chain.py \
-                --input "$DS_CORE" --impl rdf-lazy --threads "$threads" \
-                ${chain_args[@]+"${chain_args[@]}"}
-        done
-    done
-fi
-
-# T2: N threads against N units of work, so each thread keeps the same slice of it. Ideal
-# weak scaling is a flat wall-time line.
-if has_test weak; then
-echo "=== T2 weak scaling: $WEAK_PATTERN on N threads ==="
-    for repeat in $(seq 1 "$REPEATS_WEAK"); do
-        for n in $WEAK_SERIES; do
-        weak_ds="$(weak_input "$n")"
-            run_one "r${repeat}_weak_filter_rdf_t${n}" bench_filter.py \
-                --input "$weak_ds" --impl rdf --threads "$n"
-            run_one "r${repeat}_weak_chain_rdf-lazy_t${n}" bench_chain.py \
-            --input "$weak_ds" --impl rdf-lazy --threads "$n"
-            run_one "r${repeat}_weak_eff_jit_t${n}" bench_efficiency.py \
-                --input "$weak_ds" --impl jit --threads "$n"
-        done
-    done
-fi
-
-# T4: single-threaded, because the number of event loops is a property of how the query was
-# written rather than of the machine.
+# Query structure: single-threaded, because the number of event loops is a property of how the
+# query was written rather than of the machine.
 if has_test qstruct; then
-    echo "=== T4 query structure: chain lengths $CHAIN_LENS ==="
+    echo "=== query structure: chain lengths $CHAIN_LENS ==="
     for repeat in $(seq 1 "$REPEATS_QSTRUCT"); do
         for len in $CHAIN_LENS; do
             for impl in rdf-lazy rdf-eager rdf-report; do
@@ -782,100 +560,12 @@ if has_test qstruct; then
 done
 fi
 
-# T5: every implementation on one input, so the comparison a reader is most likely to
-# challenge is "same files, same codec, same events". The Python chain alone costs ~16 min
-# on ~11 M events, which is why the impl input is not the (larger) core input on real data,
-# and why it runs in the first repeat only. With a single run the RDF chain and efficiency
-# came out 12-24% slower than the identical T1 t0 runs, hence the repeats for the rest.
-#
-# ONLY_USED=1 drops the three variants that no figure and no number in the thesis uses: the
-# AsNumpy `vector` mode (always slower than `loop`, and the figure keeps one Python bar),
-# correctionlib (part of the RDataFrame solution, not a competing implementation) and the
-# unpinned uproot runs. On the 1 TB set each of them would still cost tens of minutes.
-if has_test impl; then
-echo "=== T5 implementations on $(basename "$DS_IMPL")${TASKSET_BIN:+, pinned to core $PIN_CORE}${ONLY_USED:+, plotted variants only} ==="
-export PINNED=1
-    for repeat in $(seq 1 "$REPEATS_IMPL"); do
-    run_one "r${repeat}_impl_filter_rdf" bench_filter.py --input "$DS_IMPL" --impl rdf
-    if [[ -z "$ONLY_USED" ]]; then
-        run_one "r${repeat}_impl_filter_python_vector" bench_filter.py \
-            --input "$DS_IMPL" --impl python --mode vector
-    fi
-        run_one "r${repeat}_impl_filter_python_loop" bench_filter.py \
-        --input "$DS_IMPL" --impl python --mode loop
-    run_one "r${repeat}_impl_filter_uproot" bench_filter.py --input "$DS_IMPL" --impl uproot
-
-    run_one "r${repeat}_impl_chain_rdf-lazy" bench_chain.py --input "$DS_IMPL" --impl rdf-lazy
-    if [[ "$repeat" -eq 1 ]]; then
-        run_one "r${repeat}_impl_chain_python" bench_chain.py --input "$DS_IMPL" --impl python
-    fi
-    run_one "r${repeat}_impl_chain_uproot" bench_chain.py --input "$DS_IMPL" --impl uproot
-
-    run_one "r${repeat}_impl_eff_jit" bench_efficiency.py --input "$DS_IMPL" --impl jit
-    if [[ -z "$ONLY_USED" ]]; then
-        run_one "r${repeat}_impl_eff_correctionlib" bench_efficiency.py \
-            --input "$DS_IMPL" --impl correctionlib
-        run_one "r${repeat}_impl_eff_python_vector" bench_efficiency.py \
-            --input "$DS_IMPL" --impl python --mode vector
-    fi
-        run_one "r${repeat}_impl_eff_python_loop" bench_efficiency.py \
-        --input "$DS_IMPL" --impl python --mode loop
-    run_one "r${repeat}_impl_eff_uproot" bench_efficiency.py --input "$DS_IMPL" --impl uproot
-done
-unset PINNED
-# uproot as a user gets it, with whatever threads it starts; a separate, labelled point.
-if [[ -z "$ONLY_USED" ]]; then
-    run_one "r1_impl_filter_uproot-default" bench_filter.py --input "$DS_IMPL" --impl uproot \
-        --tag own-threads
-    run_one "r1_impl_chain_uproot-default" bench_chain.py --input "$DS_IMPL" --impl uproot \
-        --tag own-threads
-    run_one "r1_impl_eff_uproot-default" bench_efficiency.py --input "$DS_IMPL" --impl uproot \
-        --tag own-threads
-fi
-fi
-
-# T6: T1's sweep on an input that differs from the core one only in width. If the per-thread
-# cost (on ds_x32: ~245 MB RSS and ~55 ms of loop time per extra thread) comes from the ~2000
-# branches every worker has to set up, it shrinks here and the speedup peak moves right.
-if has_test slim; then
-echo "=== T6 file width: $(basename "$DS_SLIM") ==="
-for repeat in $(seq 1 "$REPEATS_SLIM"); do
-    for threads in 0 $THREADS_LIST; do
-        run_one "r${repeat}_slim_filter_rdf_t${threads}" bench_filter.py \
-            --input "$DS_SLIM" --impl rdf --threads "$threads"
-        run_one "r${repeat}_slim_chain_rdf-lazy_t${threads}" bench_chain.py \
-            --input "$DS_SLIM" --impl rdf-lazy --threads "$threads"
-        run_one "r${repeat}_slim_eff_jit_t${threads}" bench_efficiency.py \
-            --input "$DS_SLIM" --impl jit --threads "$threads"
-    done
-done
-fi
-
-# T2S: T2 on the slim copies. On the full files one unit of work (0.24-0.52 s of loop per
-# thread) is smaller than the ~1 s of CPU each worker spends building its ~2000-branch tree,
-# so T2 mostly measures that setup. Here the setup is gone and what remains is the scaling of
-# the work itself.
-if has_test weakslim; then
-echo "=== T2S weak scaling on slim: $WEAK_SLIM_PATTERN on N threads ==="
-for repeat in $(seq 1 "$REPEATS_WEAK"); do
-    for n in $WEAK_SERIES; do
-        weak_ds="$(weak_slim_input "$n")"
-        run_one "r${repeat}_weakslim_filter_rdf_t${n}" bench_filter.py \
-            --input "$weak_ds" --impl rdf --threads "$n"
-        run_one "r${repeat}_weakslim_chain_rdf-lazy_t${n}" bench_chain.py \
-            --input "$weak_ds" --impl rdf-lazy --threads "$n"
-        run_one "r${repeat}_weakslim_eff_jit_t${n}" bench_efficiency.py \
-            --input "$weak_ds" --impl jit --threads "$n"
-    done
-done
-fi
-
-# T5 against input size: the same variants as T5's figure, pinned to one core, on 1..9 copies.
-# What one input cannot show is how memory grows with the data: RDataFrame streams cluster by
-# cluster, while uproot and AsNumpy hold whole columns, and RDataFrame's fixed JIT cost is
-# amortised only past some size. The last point is T5 on ~100 GB.
+# The implementations against input size, pinned to one core, on 1..9 copies. What one input
+# cannot show is how memory grows with the data: RDataFrame streams cluster by cluster, while
+# uproot and AsNumpy hold whole columns, and RDataFrame's fixed JIT cost is amortised only past
+# some size. The last point is ~100 GB.
 if has_test size; then
-echo "=== T5 against input size, RDataFrame and uproot: $SIZE_SERIES copies${TASKSET_BIN:+, pinned to core $PIN_CORE} ==="
+echo "=== against input size, RDataFrame and uproot: $SIZE_SERIES copies${TASKSET_BIN:+, pinned to core $PIN_CORE} ==="
 export PINNED=1
 for n in $SIZE_SERIES; do
     size_ds="$(size_input "$n")"
@@ -914,7 +604,7 @@ size_py() {
 }
 
 if has_test sizepy; then
-echo "=== T5 against input size, Python: $SIZE_SERIES copies${TASKSET_BIN:+, pinned to core $PIN_CORE} ==="
+echo "=== against input size, Python: $SIZE_SERIES copies${TASKSET_BIN:+, pinned to core $PIN_CORE} ==="
 export PINNED=1
 for n in $SIZE_SERIES; do
     size_ds="$(size_input "$n")"

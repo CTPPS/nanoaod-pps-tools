@@ -147,7 +147,7 @@ def count_events(args, tree="Events"):
     A Count() action would be an entire event loop -- on a 14 M event file that was ~150 s per
     run. Opening each file is not free either: ~0.2 s for a ~2000-branch NanoAOD on Lustre,
     ~5 min per run over the 1453 Run 3 files. With $EVENT_COUNTS (an
-    archive/inventory_files.py CSV) the counts come from there, and the files are opened only if
+    inventory_files.py CSV) the counts come from there, and the files are opened only if
     one of them is not in it.
     """
     return sum(file_entries(input_files(args.input), tree))

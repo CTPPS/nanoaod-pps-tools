@@ -432,17 +432,27 @@ data/
 ### Diamond detector efficiency
 
 `apply_diamond_efficiency_jit()` assigns a per-track efficiency from a `correctionlib` payload
-keyed by detector region:
+keyed by detector region. `app/efficiency.json` itself is not such a payload: it lists the
+efficiencies per run, arm and pot type, and `build_diamond_efficiency_json()`
+(`corrections-examples/build_correction.py`) turns one list into the payload first. Key `i` of
+the payload is element `i` of the list, i.e. region `i` of `diamond_geometry`, counted from the
+end of the sensor row with the smallest x.
 
 ```python
+from build_correction import build_diamond_efficiency_json   # corrections-examples/ on sys.path
 from apply_corrections import apply_diamond_efficiency_jit
 
+payload = build_diamond_efficiency_json(
+    "efficiency.json", arm_key="45", run_number=396733,
+    out_path="corrections-examples/diamond_efficiency_arm45.json",
+    pot_type="box",        # "box" (3 regions) or "cyl" (4 regions)
+)
 df = apply_diamond_efficiency_jit(
     df,
     rp_id=22,              # diamond RP: 16, 22, 116, 122
     arm_key="45",          # "45" or "56"
-    correction_json="efficiency.json",
-    pot_type="box",        # "box" (3 regions) or "cyl" (4 regions)
+    correction_json=payload,
+    pot_type="box",
 )
 ```
 
@@ -542,29 +552,31 @@ nanoaod-pps-tools/
 │   ├── apply_corrections.py         # Correction application tool
 │   ├── diamond_geometry.py          # Detector geometry, Python and C++
 │   ├── pps_analysis.ipynb           # Interactive walkthrough
-│   ├── efficiency.json              # Diamond efficiency payload
+│   ├── efficiency.json              # Diamond efficiencies per run, arm, pot type (not correctionlib)
 │   └── diamond_alignment_coords_2025.json
-├── test/                         # Benchmark suite: the files of the final campaign
-│   ├── README.md                    # What is measured and how to run it
-│   ├── FINAL.md                     # The final campaign: its files, steps and command
-│   ├── slurm_final.sbatch           # The final campaign as one Helios job
-│   ├── slurm_run3.sbatch            # Run 3 steps (J1, J3, J4) of it
-│   ├── slurm_benchmark.sbatch       # Whole-node job, Ares or Helios (step R)
-│   ├── run_all.sh                   # Validation + campaign
-│   ├── run_benchmark.sh             # Campaign driver
-│   ├── check_chain11.py             # The chain on every file of a set, before measuring it
-│   ├── archive/                     # Data fetching and finished campaigns, not run any more
+├── test/                         # Benchmark suite: the scripts behind the thesis results
+│   ├── README.md                    # Which script produces which result, and how to rerun it
+│   ├── slurm_benchmark.sbatch       # Copies of ds_x32 (single core on Ares, file-width control)
+│   ├── slurm_run3.sbatch            # Run 3 NanoAOD on Helios (strong scaling, whole node)
+│   ├── run_benchmark.sh             # Campaign driver called by both
 │   ├── bench_*.py                   # Individual benchmarks
 │   ├── impl_*.py                    # RDataFrame, uproot and numpy implementations
 │   ├── validate.py                  # Cross-checks the implementations agree
-│   └── plot_results.py              # Figures and summary CSV
+│   ├── inventory_files.py           # Entries and branch sizes of every input file
+│   ├── dataset_json.py              # dataset.json: codec, branches, baskets of a set
+│   ├── plot_results.py              # Per-set figures and bench.csv
+│   ├── plot_real_vs_synthetic.py    # Strong-scaling figure and table (results/comparison)
+│   └── plot_memory_control.py       # Memory per thread, full against slim files
+├── results/                      # The measured sets used in the thesis (results/README.md)
 ├── examples/
 │   └── test.root                    # Example NanoAOD file (Git LFS)
 ├── corrections-examples/
+│   ├── build_correction.py          # Writes correctionlib payloads, incl. the diamond ones
 │   ├── x_track_range_correction.json
 │   ├── per_track_direct_values.json
 │   ├── per_track_binned_array.json
-│   └── per_event_per_track.json
+│   ├── per_event_per_track.json
+│   └── diamond_efficiency_*.json    # region_idx -> efficiency, built from app/efficiency.json
 └── data/                         # Output directory (auto-created)
     ├── *.root                       # ROOT histogram files
     └── *.png                        # PNG plots
@@ -578,19 +590,17 @@ nanoaod-pps-tools/
 ## Benchmarks
 
 The `test/` directory holds a benchmark suite comparing RDataFrame against `uproot`/`awkward`
-and a pure Python/numpy baseline, on the `ds_x1`–`ds_x32` series (0.35 to 11 million events)
-and on real 2023 Tier0 NanoAOD file lists (`DATASET=real`): strong and weak thread scaling,
-query structure, implementation comparison and file width.
+and a pure Python/numpy baseline: on one core on copies of `ds_x32.root` (query structure and
+input size), on ~4.5 TB of Run 3 NanoAOD (strong scaling to 192 threads, and the whole node),
+and on full against slim copies of the same events (what the file width costs per thread).
 
 ```bash
-python test/validate.py              # cross-check that implementations agree
-./test/run_all.sh                    # validation + full campaign
-sbatch test/slurm_benchmark.sbatch   # the same on an exclusive Ares node
+python test/validate.py                                    # cross-check that implementations agree
+sbatch test/slurm_benchmark.sbatch                         # single core, exclusive Ares node
+sbatch --export=ALL,JOB=J3 test/slurm_run3.sbatch          # Run 3 whole node, Helios
 ```
 
-Headline results: memory stays under 1 GB regardless of dataset size, against 11 GB for the
-numpy path; throughput is roughly 106x higher; and query formulation alone accounts for a 3.4x
-difference at identical output. See `test/README.md` for the campaign and how to run it.
+See `test/README.md` for every campaign and `results/README.md` for what each set backs.
 
 ---
 

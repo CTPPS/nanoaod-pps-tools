@@ -12,61 +12,32 @@
 #SBATCH --output=bench-ares-%j.out
 #SBATCH --error=bench-ares-%j.err
 
-# Ares: 48 cores/node, ~192 GB RAM. The CPU model is printed by the lscpu dump below rather
-# than asserted here, because the two places in this repo that name it disagree.
+# Block A (Ares, one core) and the file-width control (Helios) on copies of ds_x32.root
+# (DATASET=big, run_benchmark.sh): validate.py, then the measurements, read cold from Lustre.
 #
 # --exclusive is not optional: a shared node makes every scaling number a measurement of the
-# neighbours' load. The extra allocation cost buys the only version of this plot worth showing.
+# neighbours' load. --mem=0 (the whole node): the cgroup limit applies to page cache too.
+# --hint=nomultithread so that N threads means N physical cores.
 #
-# --mem=0 (the whole node) rather than 180G: the cgroup limit applies to page cache too, and
-# the inputs are ~21 GB (synthetic) to ~60 GB (real). Capping it below the node's RAM puts the
-# cgroup's reclaim policy inside the memory and bytes-read measurements.
+# Block A, two jobs into the same directory (never both at once: they would append to the same
+# raw.jsonl and share Lustre bandwidth, which is what the cold reads measure):
+#   sbatch --time=06:00:00 test/slurm_benchmark.sbatch                       # qstruct, size
+#   sbatch --time=12:00:00 --dependency=afterany:<id> \
+#       --export=ALL,TESTS=sizepy,RESUME=1 test/slurm_benchmark.sbatch       # Python series
 #
-# --hint=nomultithread so that 48 means 48 physical cores. With SMT counted in, the 32- and
-# 48-thread points would be two threads sharing a core, and the flattening they show would be
-# a property of the allocation rather than of the code.
-#
-# The synthetic campaign is ~1.5 h (406 runs plus validate.py and writing the slim copies on the
-# first job; `DRY_RUN=1 test/run_benchmark.sh` lists them). The real one has 424 runs and a
-# ~4x larger core input, so T1, T2 and T6 take roughly 3x longer: budget ~3-4 h. The margin
-# covers a slow Lustre day; a job that runs out of wall clock has to queue again.
-#
-#   sbatch test/slurm_benchmark.sbatch                              # ds_x1..ds_x32
-#   sbatch --export=ALL,DATASET=real test/slurm_benchmark.sbatch    # lists in $SCRATCH/bench/real
-#   sbatch -C memfs --export=ALL,STORAGE=memfs test/slurm_benchmark.sbatch   # inputs in RAM
-#   sbatch --time=06:00:00 --export=ALL,DATASET=big test/slurm_benchmark.sbatch   # job A
-#   sbatch --time=12:00:00 --dependency=afterany:<job A id> \
-#       --export=ALL,DATASET=big,TESTS=sizepy,RESUME=1 test/slurm_benchmark.sbatch   # job B
-#
-# DATASET=big is ~1 TB of plain copies of ds_x32.root, ds_1..ds_96.root in the same directory.
-# Make them once, on the login node and before the first such job (tens of minutes that an
-# exclusive node should not spend on `cp`):
-#   bash test/archive/make_bigset.sh --source $SCRATCH/bench/data/ds_x32.root
-# One repeat per point, cold reads throughout so each run pays for its own I/O. Two jobs:
-#   A  (~3.5 h, 99 runs)  T1 and T2 on up to 1 TB, T4 on ~100 GB, and the size series
-#                         (~11-98 GB, one core) for RDataFrame and uproot;
-#   B  (~9 h, 21 runs)    the same series for Python, appended to A's results (RESUME=1).
-# afterany starts B once A has ended, however it ended. Never both at once: they would append to
-# the same raw.jsonl and share Lustre bandwidth, which is what the cold reads measure.
-#
-# RESUME=1 also restarts either job after it ran out of wall clock: only the missing runs go.
-#
-# Helios (192 cores/node, ~386 GB, partition plgrid): the same file, with the core count and
-# the log names given on the command line and MACHINE, THREADS_LIST and RESULTS in the
-# environment. Four jobs in a chain, T1 on 11 M, 100 M, 355 M and 1065 M events, the last
-# with T2 at one copy per thread (192 threads at two would need 384 copies, 4 TB):
-#   export MACHINE=helios DATASET=big SIZE_SERIES="9 32"
-#   export THREADS_LIST="1 2 4 8 12 16 24 32 48 64 80 96 128 160 192"
-#   # --mem=0 is rejected there: MaxMemPerNode=384000 is below the nodes' 386084+ MB.
+# File-width control on Helios (192 cores; --mem=0 is rejected there, MaxMemPerNode=384000):
 #   H="--cpus-per-task=192 --mem=384000 --output=bench-helios-%j.out --error=bench-helios-%j.err"
-#   H1=$(sbatch --parsable $H -t 03:00:00 --export=ALL,TESTS=strong,REPEATS_STRONG=3,\
-#   DS_CORE=$SCRATCH/bench/data/ds_x32.root,RESULTS=$SCRATCH/bench/results-helios-x32 test/slurm_benchmark.sbatch)
-#   ... (test/README.md, "Helios", has all four)
+#   export MACHINE=helios TESTS=strong11 RUN_TIMEOUT=86400 \
+#       THREADS_LIST="1 4 8 12 16 24 32 48 64 80 96 112 128 144 160 176 192" \
+#       STRONG11_R2_THREADS="96 112 128 144 160 176 192" STRONG11_R3_THREADS="144 176 192" \
+#       STRONG11_R4_THREADS="144 176"
+#   # full copies: ds_1..ds_96.root in $SCRATCH/bench/data
+#   sbatch $H -t 40:00:00 --export=ALL,RESULTS=$SCRATCH/bench/results-helios-full11 test/slurm_benchmark.sbatch
+#   # slim copies (only the chain's 10 branches) in $SCRATCH/bench/slim11, count in copies.txt
+#   sbatch $H -t 40:00:00 --export=ALL,DATA_DIR=$SCRATCH/bench/slim11,RESULTS=$SCRATCH/bench/results-helios-slim11 \
+#       test/slurm_benchmark.sbatch
 #
-# STORAGE=memfs copies DATA_DIR into the job's RAM disk before the campaign, so the same runs
-# read no byte from Lustre. The difference against the default campaign is what the shared
-# file system costs. -C memfs has to be given on the command line: a #SBATCH line here would
-# force it on every campaign. MEMFS is capped at 120 GB and counts towards --mem.
+# RESUME=1 restarts a job that ran out of wall clock: only the missing runs go.
 
 set -euo pipefail
 
@@ -86,9 +57,6 @@ set -u
 
 cd "${SCRATCH_BENCH}/nanoaod-pps-tools"
 
-# Everything below this job measures parallel scaling, so the one thing that must be true
-# before it starts is that the process can actually reach 48 cores. Printed in full because
-# the CPU model and the SMT setting both belong in the thesis and neither is worth guessing.
 echo "=== allocation ==="
 echo "node               : $(hostname) (${MACHINE})"
 lscpu | grep -E 'Model name|^CPU\(s\)|Thread\(s\) per core|Core\(s\) per socket|Socket|NUMA node\(s\)'
@@ -109,69 +77,13 @@ fi
 echo
 
 export PY="$(command -v python)"
-export DATASET="${DATASET:-synthetic}"
+export DATASET=big
 export THREADS_LIST="${THREADS_LIST:-1 2 4 8 12 16 24 32 48}"
-# DATA_DIR and RUN_TIMEOUT given in --export win over the per-dataset defaults: the 11-filter
-# campaign reads a different directory, and its 1-thread run alone takes ~8-12 h.
-case "$DATASET" in
-    real)
-        export DATA_DIR="${DATA_DIR:-${SCRATCH_BENCH}/real}"
-        export RESULTS="${RESULTS:-${SCRATCH_BENCH}/results-${MACHINE}-real}"
-        export RUN_TIMEOUT="${RUN_TIMEOUT:-2400}"
-        ;;
-    big)
-        # ds_1..ds_96.root next to ds_x32.root, made beforehand by make_bigset.sh.
-        export DATA_DIR="${DATA_DIR:-${SCRATCH_BENCH}/data}"
-        export RESULTS="${RESULTS:-${SCRATCH_BENCH}/results-${MACHINE}-big}"
-        # The longest run is the Python chain on 9 copies, ~2.5 h plus its cold read.
-        export RUN_TIMEOUT="${RUN_TIMEOUT:-14400}"
-        ;;
-    *)
-        export DATA_DIR="${DATA_DIR:-${SCRATCH_BENCH}/data}"
-        export RESULTS="${RESULTS:-${SCRATCH_BENCH}/results-${MACHINE}}"
-        export RUN_TIMEOUT="${RUN_TIMEOUT:-2400}"
-        ;;
-esac
-
-export STORAGE="${STORAGE:-lustre}"
-# MEMFS is RAM: it holds at most 120 GB and every byte of it is taken from the node's memory,
-# so it can neither hold the 1 TB set nor relieve memory pressure. The big campaign reads cold
-# from Lustre instead, which is the point of it.
-if [[ "$STORAGE" == memfs && "$DATASET" == big ]]; then
-    echo "ERROR: STORAGE=memfs cannot hold DATASET=big (~1 TB; MEMFS is at most 120 GB of RAM)." >&2
-    exit 1
-fi
-if [[ "$STORAGE" == memfs ]]; then
-    if [[ -z "${MEMFS:-}" || ! -d "${MEMFS}" ]]; then
-        echo "ERROR: STORAGE=memfs but \$MEMFS is not set. Submit with: sbatch -C memfs ..." >&2
-        exit 1
-    fi
-    # An absolute path in a list would still point at Lustre after the copy, and the run would
-    # quietly measure the file system this campaign is meant to remove.
-    if compgen -G "${DATA_DIR}/*.txt" >/dev/null \
-        && grep -lE '^/' "${DATA_DIR}"/*.txt; then
-        echo "ERROR: the lists above contain absolute paths; they would not move to MEMFS." >&2
-        exit 1
-    fi
-    # The 1 TB set's copies (ds_1.root ...) and its lists/ share the synthetic set's directory
-    # and are not part of this campaign.
-    memfs_inputs=()
-    while IFS= read -r entry; do memfs_inputs+=("$entry"); done < <(
-        find "${DATA_DIR}" -mindepth 1 -maxdepth 1 ! -name 'ds_[0-9]*.root' ! -name lists)
-    need_kb="$(du -skc "${memfs_inputs[@]}" | tail -1 | cut -f1)"
-    free_kb="$(df -Pk "${MEMFS}" | awk 'NR == 2 {print $4}')"
-    echo "=== copying ${DATA_DIR} ($((need_kb / 1048576)) GB) to MEMFS ($((free_kb / 1048576)) GB free) ==="
-    if [[ "$need_kb" -ge "$free_kb" ]]; then
-        echo "ERROR: the inputs do not fit in MEMFS." >&2
-        exit 1
-    fi
-    # Missing slim copies would be written into MEMFS and lost with the job; run the Lustre
-    # campaign first so that they exist.
-    mkdir -p "${MEMFS}/data"
-    cp -a "${memfs_inputs[@]}" "${MEMFS}/data/"
-    export DATA_DIR="${MEMFS}/data"
-    export RESULTS="${RESULTS}-memfs"
-fi
+# ds_1..ds_96.root next to ds_x32.root.
+export DATA_DIR="${DATA_DIR:-${SCRATCH_BENCH}/data}"
+export RESULTS="${RESULTS:-${SCRATCH_BENCH}/results-${MACHINE}-big}"
+# The longest run is the Python chain on 9 copies, ~2.5 h plus its cold read.
+export RUN_TIMEOUT="${RUN_TIMEOUT:-14400}"
 
 # run_benchmark.sh appends to $RESULTS/raw.jsonl, so a directory left over from an earlier
 # campaign would quietly mix its records in. Start a new directory and keep the old one --
@@ -181,22 +93,27 @@ if [[ -z "${RESUME:-}" && -f "${RESULTS}/raw.jsonl" ]]; then
     echo "moving previous results to ${previous}"
     mv "${RESULTS}" "${previous}"
 fi
+mkdir -p "${RESULTS}"
 
-# DATASET_JSON_INPUT (a list or a file) writes $RESULTS/dataset.json, which the plots and
-# plot_real_vs_synthetic.py read the codec, branches and baskets of the set from;
-# DATASET_JSON_INVENTORY adds the event and schema counts over every file.
-if [[ -n "${DATASET_JSON_INPUT:-}" && ! -f "${RESULTS}/dataset.json" ]]; then
-    mkdir -p "${RESULTS}"
-    "$PY" test/dataset_json.py --out "${RESULTS}" --input "${DATASET_JSON_INPUT}" \
-        ${DATASET_JSON_INVENTORY:+--inventory "${DATASET_JSON_INVENTORY}"}
+# dataset.json: the codec, branches and baskets per file of the set, read by
+# plot_real_vs_synthetic.py.
+if [[ ! -f "${RESULTS}/dataset.json" ]]; then
+    "$PY" test/dataset_json.py --out "${RESULTS}" --input "${DATASET_JSON_INPUT:-${DATA_DIR}/ds_1.root}"
 fi
+
+# validate.py runs on it, and every benchmark compiles its kernel on it during warmup.
+if head -c 40 examples/test.root | grep -q 'git-lfs'; then
+    echo "ERROR: examples/test.root is a Git LFS pointer; run: git lfs install && git lfs pull" >&2
+    exit 1
+fi
+echo "=== correctness [$(date +%H:%M:%S)] ==="
+"$PY" test/validate.py --threads 8
 
 # No srun. Since Slurm 22.05 a job step does not inherit --cpus-per-task from the batch
 # allocation, so `srun` here could hand the whole campaign a single CPU -- which fails
-# silently, as a flat speedup curve. The batch script already runs inside a cgroup covering
-# the full allocation, and this is one process on one node, so the step bought nothing.
-bash test/run_all.sh
+# silently, as a flat speedup curve.
+echo "=== measurements [$(date +%H:%M:%S)] ==="
+bash test/run_benchmark.sh
 
-# Independent confirmation of the numbers the script collected itself. `seff` is not installed
-# on Ares, so read the accounting database directly.
+# Independent confirmation of the numbers the script collected itself.
 sacct -j "${SLURM_JOB_ID}" --format=JobID,JobName,State,Elapsed,MaxRSS,AveCPU,NCPUS,ReqMem || true

@@ -9,7 +9,7 @@ ImplicitMT worker opens one file at a time, so it is one file's layout that it p
     dataset_json.py --out RESULTS --input core.txt [--inventory local.csv]
     dataset_json.py --out RESULTS --input ds_1.root
 
---inventory (archive/inventory_files.py output) adds the event and schema counts and the branch range
+--inventory (inventory_files.py output) adds the event and schema counts and the branch range
 over every file of the input, not only the sampled ones. It also samples each NanoAOD version
 of the input separately, and describes each one under by_version.
 """

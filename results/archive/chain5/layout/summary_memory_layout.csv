@@ -1,8 +1,0 @@
-label,dir,test,branches,baskets_per_file,clusters_per_file,rss_1_thread_mb,mb_per_thread,mb_per_thread_low,mb_per_thread_high,model_mb,residual_mb
-slim,results/helios/slim-1.5tb,chain11,10,312760,31079,519.012,16.1419,15.7249,16.0673,17.4924,-1.35056
-ds_x32,results/helios/full-11m,chain,1984,5037148,1110,898.75,207.545,242.988,187.606,188.981,18.564
-ds_x32 x96,results/helios/full-1tb,chain,1984,5037148,1110,1057.05,170.565,385.385,124.322,188.981,-18.4161
-ds_x32 head,results/real-1/results-helios-memtest,chain,1984,520366,36,573.547,44.7607,56.809,42.1675,47.7434,-2.98264
-Open Data 89 M,results/real-1/results-helios-opendata-weak4,chain,1347,603356,349,594.246,36.3425,35.8193,36.236,42.6715,-6.32892
-Open Data 356 M,results/real-1/results-helios-opendata-weak16,chain,1347,553791,318,611.977,37.6024,60.9108,31.8631,41.1216,-3.51919
-Open Data 1 TB,results/real-1/results-helios-opendata-1tb,chain,1347,498579,284,605.75,53.4285,62.3958,50.8636,39.3951,14.0334

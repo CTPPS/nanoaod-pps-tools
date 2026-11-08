@@ -4,8 +4,8 @@ Memory per thread on the same events stored two ways: the artificial full files 
 ds_x32, 1984 branches) against the slim files (the same events, the ten branches of the chain).
 
     plot_memory_control.py --out results/comparison \
-        --set "results/full-chain11/artificial-1tb:chain11:artificial, full files" \
-        --set "results/synthetic-slim:chain11:artificial, slim files" \
+        --set "results/width-full:chain11:artificial, full files" \
+        --set "results/width-slim:chain11:artificial, slim files" \
         --profile "artificial, full files" --files "artificial, full files:96"
 
 --set DIR:TEST:LABEL as in plot_real_vs_synthetic.py. --profile LABEL draws that set's RSS over
@@ -27,7 +27,7 @@ Writes into --out:
                       --files, MB per open tree), the intercept, the thread counts fitted and
                       the rms deviation of the fit
 
-Needs only matplotlib, like plot_results.py.
+Needs only matplotlib.
 """
 
 import argparse
@@ -35,8 +35,7 @@ import csv
 import os
 import sys
 
-from plot_real_vs_synthetic import STYLES, parse_set, sweep
-from plot_results import fit_linear, median
+from plot_real_vs_synthetic import STYLES, fit_linear, median, parse_set, sweep
 
 PROFILE_THREADS = (48, 96, 128, 192)
 END_SHARE = 0.10

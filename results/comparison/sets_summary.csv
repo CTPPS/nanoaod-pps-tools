@@ -1,4 +1,2 @@
-set,test,events,input_tb,codec,branches,baskets_per_file,read_gb,read_pct,loop_s_t1,loop_min_s,threads_at_min,max_speedup,plateau_threads,efficiency_96,mb_per_thread,gb_per_s_at_min,events_passed,loop_stat
-Run 2 Open Data,chain11,1046083309,1.03922,LZMA:9,1347,498579,8.8458,0.8512,1022,12.4729,144,81.9372,144,0.646716,53.8895,0.742106,14921896,best
-Run 3,chain11,3154620286,4.46562,LZMA:9,1984,237951,200.468,4.48915,12818.9,102.704,176,124.814,176,0.845504,66.2392,1.95191,1461980636,median
-"artificial, slim files",chain11,2.98325e+10,1.54433,,,,1544.62,100.019,30850.8,333.865,176,92.405,160,0.692834,16.1419,4.62939,4658282496,median
+set,test,events,input_tb,codec,branches,baskets_per_file,read_gb,read_pct,loop_s_t1,loop_min_s,threads_at_min,max_speedup,plateau_threads,efficiency_96,mb_per_thread,gb_per_s_at_min,events_passed
+"Run 3, strong scaling",chain11,3154620286,4.46562,LZMA:9,1984,237951,200.468,4.48915,12818.9,102.704,176,124.814,176,0.845504,66.2392,1.95191,1461980636

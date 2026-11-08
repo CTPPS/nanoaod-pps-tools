@@ -34,7 +34,7 @@ CHAIN_STEPS = ["pps", "double_arm", "diamond", "rp_id", "xi"]
 #
 # track_x and track_y replaced cuts on PPSLocalTrack_time and _timeUnc: pixel and strip tracks
 # carry time 0, so on Run 2 and Run 3 those two read branches of zeros and dropped nothing. The
-# slim set (results/synthetic-slim) was measured with them, the real sets with x and y.
+# slim set (results/width-slim) was measured with them, the real sets with x and y.
 LONG_CHAIN_STEPS = ["theta_y", "multi_proton", "multi_rp_idx", "single_rp_idx", "track_x",
                     "track_y"] + CHAIN_STEPS
 CHAINS = {"base": CHAIN_STEPS, "long": LONG_CHAIN_STEPS}

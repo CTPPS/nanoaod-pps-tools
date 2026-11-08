@@ -264,7 +264,7 @@ CORE_TEST_LABEL = {
     "filter": "single filter",
     "chain": "5-filter chain",
     "chain11": "10-branch chain",
-    "efficiency": "efficiency column",
+    "efficiency": "per-track correction",
 }
 CORE_TEST_COLOUR = {"filter": "#4575b4", "chain": "#1b7837", "chain11": "#762a83",
                     "efficiency": "#d73027"}

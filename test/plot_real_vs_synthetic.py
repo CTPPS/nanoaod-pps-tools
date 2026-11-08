@@ -1,55 +1,46 @@
 #!/usr/bin/env python3
 """
-Strong scaling of one chain on several ~1 TB sets, on the same machine: one figure and one
+Strong scaling of one chain on one or more ~1 TB sets, on the same machine: one figure and one
 table for all of them.
 
-    plot_real_vs_synthetic.py --out results/comparison \
-        --set "results/full-chain11/run2-1tb:chain11:Run 2 Open Data" \
-        --set "results/run3/chain11-full:chain11:Run 3" \
-        --set "results/synthetic-slim:chain11:artificial, slim files" \
-        --best-of "Run 2 Open Data"
-
-The artificial full files (96 copies of one ds_x32) are left out: their 5 million baskets per
-file make the memory per thread a property of the copies rather than of production files.
+    plot_real_vs_synthetic.py --out results/comparison --amdahl \
+        --set "results/run3-strong:chain11:Run 3, strong scaling"
 
 --set DIR:TEST:LABEL is a results directory, the test field of its strong sweep (chain11 for
-the 11-filter chain, chain for the 5-filter one) and the name the set goes by; a directory
-without raw.jsonl or without that sweep is skipped with a warning, so sets still being measured
-can stay on the command line. --figure LABEL puts a set in the figure (every set without any
---figure). Full-width files, of which the chain reads a few percent, and the slim set, which it
-reads whole, side by side show what the width of a file costs each thread.
+the 11-filter chain) and the name the set goes by; a directory without raw.jsonl or without
+that sweep is skipped with a warning. --figure LABEL puts a set in the figure (every set
+without any --figure).
 
---best-of LABEL takes a set's loop time at each thread count as the fastest of its repeats
-instead of their median, for a set whose repeats were slowed down from outside by different
-amounts (e.g. Run 2 measured while a download was writing to the same Lustre). The min-max band
-stays, the table marks the set, and sets_summary.csv says which statistic each row uses
-(loop_stat). Thread counts run once are the same either way.
+--amdahl fits Amdahl's law S = 1/(s + (1-s)/N) to each strong curve, by least squares of the
+relative error of S, draws it dotted on the speedup panel and prints s, 1/s and the
+Karp-Flatt serial fraction e(N) = (1/S - 1/N)/(1 - 1/N) of every point.
 
 Writes into --out:
   full_files_chain11.png  loop time, speedup against one thread and peak RSS against the thread
                           count, each with the min-max of the repeats
   sets_summary.csv        every column below, plus the events passing the chain
-  sets_summary.tex        the table for the thesis, one column per set
 and prints the table. Per set: events; size on disk; codec, branches and baskets per file
 (dataset.json, when the job wrote one); bytes read in the event loop at one thread, in GB and as
 a share of the set; the fastest point (S_max and its thread count); the 5% plateau, the fewest
 threads within 5% of the fastest loop; E at 96 threads; MB per thread (slope of peak RSS); and
 GB/s read at the fastest point.
 
-Needs only matplotlib, like plot_results.py.
+Loop times are medians of the repeats; a run slower than OUTLIER_FACTOR (default 1.5) times
+the median of its configuration (at least three ok runs) is left out as disturbed.
+
+Needs only matplotlib.
 """
 
 import argparse
 import csv
 import json
 import os
+import re
 import sys
+from collections import defaultdict
 
-from plot_results import core_rows, dedupe_labels, fit_linear, flag_disturbed, load_records, \
-    median
-
-# Fewer than plot_results.LABELLED_THREADS: three panels side by side leave less room per tick.
-LABELLED = {1, 2, 4, 8, 16, 32, 64, 128, 192}
+# A linear thread axis: the last third of the node, where the curves flatten, gets a third of it.
+THREAD_TICKS = list(range(0, 193, 32))
 STYLES = [
     {"color": "#1b7837", "marker": "o"},
     {"color": "#d73027", "marker": "^"},
@@ -57,13 +48,83 @@ STYLES = [
     {"color": "#762a83", "marker": "D"},
     {"color": "black", "marker": "v"},
 ]
+
+
+def style_of(label, index):
+    """A fixed colour for Run 2, Run 3 and slim sets across all comparison figures, else the next one."""
+    for position, key in enumerate(("Run 2", "Run 3", "slim")):
+        if key in label:
+            return STYLES[position]
+    return STYLES[index % len(STYLES)]
+
+
 PLATEAU = 0.05
 EFFICIENCY_AT = 96
 FIELDS = ["set", "test", "events", "input_tb", "codec", "branches", "baskets_per_file",
           "read_gb", "read_pct", "loop_s_t1", "loop_min_s", "threads_at_min", "max_speedup",
           "plateau_threads", "efficiency_96", "mb_per_thread", "gb_per_s_at_min",
-          "events_passed", "loop_stat"]
-BEST_MARK = "*"
+          "events_passed"]
+OUTLIER_FACTOR = float(os.environ.get("OUTLIER_FACTOR", "1.5"))
+
+
+def median(values):
+    values = sorted(values)
+    if not values:
+        return None
+    mid = len(values) // 2
+    return values[mid] if len(values) % 2 else (values[mid - 1] + values[mid]) / 2
+
+
+def fit_linear(xs, ys):
+    """Least-squares intercept and slope."""
+    n = len(xs)
+    mean_x, mean_y = sum(xs) / n, sum(ys) / n
+    sxx = sum((x - mean_x) ** 2 for x in xs)
+    slope = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys)) / sxx
+    return mean_y - slope * mean_x, slope
+
+
+def load_records(results_dir):
+    path = os.path.join(results_dir, "raw.jsonl")
+    if not os.path.exists(path):
+        return []
+    with open(path) as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
+def dedupe_labels(records):
+    """
+    The last record per label. A repeated label means the directory was appended to (a job
+    that died partway and was resubmitted with RESUME=1); the run that completed wrote the
+    later record.
+    """
+    last_index = {record.get("label"): index for index, record in enumerate(records)}
+    return [r for i, r in enumerate(records) if last_index[r.get("label")] == i]
+
+
+def flag_disturbed(records, factor=OUTLIER_FACTOR):
+    """
+    Marks runs slowed down by the machine rather than by the code, as status "disturbed".
+
+    On the shared Lustre of Helios a run occasionally takes two to three times as long as its
+    repeats while reading the same bytes. A configuration (the label without its r<N>_ prefix)
+    needs at least three ok runs, since with two there is no telling which one is off, and a
+    run is disturbed when its loop time exceeds `factor` times the configuration's median.
+    """
+    if factor <= 0:
+        return
+    groups = defaultdict(list)
+    for record in records:
+        match = re.match(r"r\d+_(.+)", str(record.get("label", "")))
+        if match and record.get("status") == "ok" and record.get("wall_loop") is not None:
+            groups[match.group(1)].append(record)
+    for runs in groups.values():
+        if len(runs) < 3:
+            continue
+        typical = median([r["wall_loop"] for r in runs])
+        for r in runs:
+            if r["wall_loop"] > factor * typical:
+                r["status"] = "disturbed"
 
 
 def parse_set(text):
@@ -73,13 +134,14 @@ def parse_set(text):
     return parts
 
 
-def sweep(results_dir, test, best=False):
-    """Per thread count: median (best: fastest) loop time, median peak RSS and the runs."""
-    records, _ = dedupe_labels(load_records(results_dir))
+def sweep(results_dir, test):
+    """Per thread count of the strong sweep (r<N>_strong_*): median loop time, peak RSS, runs."""
+    records = dedupe_labels(load_records(results_dir))
     flag_disturbed(records)
-    ok = [r for r in records if r.get("status") == "ok"]
-    runs = [r for r in core_rows(ok, "strong")
-            if r.get("test") == test and r.get("threads") and r.get("wall_loop") is not None]
+    strong = re.compile(r"r\d+_strong_")
+    runs = [r for r in records
+            if r.get("status") == "ok" and strong.match(str(r.get("label", "")))
+            and r.get("test") == test and r.get("threads") and r.get("wall_loop") is not None]
     by_threads = {}
     for r in runs:
         by_threads.setdefault(r["threads"], []).append(r)
@@ -89,7 +151,7 @@ def sweep(results_dir, test, best=False):
         rss = [r["peak_rss_kb"] / 1024 ** 2 for r in group if r.get("peak_rss_kb")]
         points.append({
             "threads": n,
-            "loop": (min if best else median)([r["wall_loop"] for r in group]),
+            "loop": median([r["wall_loop"] for r in group]),
             "loop_lo": min(r["wall_loop"] for r in group),
             "loop_hi": max(r["wall_loop"] for r in group),
             "rss_gb": median(rss) if rss else None,
@@ -111,7 +173,7 @@ def dataset_info(results_dir):
         return json.load(f)
 
 
-def summarise(name, test, points, info, fastest_of_repeats=False):
+def summarise(name, test, points, info):
     first = points[0]
     one = first["runs"] if first["threads"] == 1 else []
     best = min(points, key=lambda p: p["loop"])
@@ -146,8 +208,28 @@ def summarise(name, test, points, info, fastest_of_repeats=False):
         "gb_per_s_at_min": read_best / best["loop"] / 1e9 if read_best is not None else None,
         # More than one value would mean the thread count changed the answer.
         "events_passed": " ".join(str(v) for v in passed),
-        "loop_stat": "best" if fastest_of_repeats else "median",
     }
+
+
+def amdahl(n, s):
+    return 1 / (s + (1 - s) / n)
+
+
+def fit_amdahl(points):
+    """Serial fraction s minimising the squared relative error of Amdahl's speedup, to 1e-7."""
+    measured = [(p["threads"], points[0]["loop"] / p["loop"]) for p in points]
+
+    def cost(s):
+        return sum((amdahl(n, s) / speedup - 1) ** 2 for n, speedup in measured)
+
+    best = min((i * 1e-5 for i in range(5001)), key=cost)
+    return min((best + i * 1e-7 for i in range(-100, 101) if best + i * 1e-7 >= 0), key=cost)
+
+
+def karp_flatt(points):
+    """(threads, e) for every point above one thread."""
+    return [(p["threads"], (p["loop"] / points[0]["loop"] - 1 / p["threads"])
+             / (1 - 1 / p["threads"])) for p in points if p["threads"] > 1]
 
 
 def mb_slope(points):
@@ -160,22 +242,22 @@ def fmt(value, spec):
 
 
 TABLE = [
-    # (console head, LaTeX row, key, format)
-    ("events", r"Events [$10^9$]", "events", ".3g"),
-    ("TB", "Size on disk [TB]", "input_tb", ".2f"),
-    ("codec", "Codec", "codec", "s"),
-    ("branches", "Branches per file", "branches", ""),
-    ("baskets", "Baskets per file", "baskets_per_file", ","),
-    ("read GB", "Read in the loop [GB]", "read_gb", ".1f"),
-    ("read %", r"Read in the loop [\%]", "read_pct", ".1f"),
-    ("T(1) s", "Loop, 1 thread [s]", "loop_s_t1", ".0f"),
-    ("Tmin s", "Fastest loop [s]", "loop_min_s", ".1f"),
-    ("at n", "at threads", "threads_at_min", "d"),
-    ("max S", r"Maximum speedup $S$", "max_speedup", ".1f"),
-    ("5% at", r"Within 5\% of fastest, from", "plateau_threads", "d"),
-    ("E(96)", r"Efficiency $E$ at 96 threads", "efficiency_96", ".2f"),
-    ("MB/thr", "Peak RSS per thread [MB]", "mb_per_thread", ".0f"),
-    ("GB/s", "Read rate at fastest [GB/s]", "gb_per_s_at_min", ".2f"),
+    # (console head, key, format)
+    ("events", "events", ".3g"),
+    ("TB", "input_tb", ".2f"),
+    ("codec", "codec", "s"),
+    ("branches", "branches", ""),
+    ("baskets", "baskets_per_file", ","),
+    ("read GB", "read_gb", ".1f"),
+    ("read %", "read_pct", ".1f"),
+    ("T(1) s", "loop_s_t1", ".0f"),
+    ("Tmin s", "loop_min_s", ".1f"),
+    ("at n", "threads_at_min", "d"),
+    ("max S", "max_speedup", ".1f"),
+    ("5% at", "plateau_threads", "d"),
+    ("E(96)", "efficiency_96", ".2f"),
+    ("MB/thr", "mb_per_thread", ".0f"),
+    ("GB/s", "gb_per_s_at_min", ".2f"),
 ]
 
 
@@ -186,18 +268,12 @@ def cell(row, key, spec):
     return fmt(value, spec)
 
 
-def set_name(row):
-    return row["set"] + (BEST_MARK if row["loop_stat"] == "best" else "")
-
-
 def print_table(rows):
-    print(f"{'':>9s}  " + "  ".join(f"{set_name(row)[:22]:>22s}" for row in rows))
-    for head, _, key, spec in TABLE:
+    print(f"{'':>9s}  " + "  ".join(f"{row['set'][:22]:>22s}" for row in rows))
+    for head, key, spec in TABLE:
         print(f"{head:>9s}  " + "  ".join(f"{cell(row, key, spec):>22s}" for row in rows))
     print("  T = event-loop time; S = T(1)/T(n); E = S/n; read at 1 thread; "
           "MB/thr = slope of a straight line through peak RSS")
-    if any(row["loop_stat"] == "best" for row in rows):
-        print(f"  {BEST_MARK} T = fastest of the repeats at each thread count, not their median")
 
 
 def write_csv(rows, path):
@@ -209,78 +285,53 @@ def write_csv(rows, path):
                              for k, v in row.items()})
 
 
-def latex_escape(text):
-    return str(text).replace("\\", r"\textbackslash{}").replace("&", r"\&") \
-        .replace("%", r"\%").replace("_", r"\_").replace("#", r"\#")
-
-
-def write_tex(rows, path):
-    lines = [r"\begin{tabular}{l" + "r" * len(rows) + "}", r"\toprule",
-             " & ".join([""] + [latex_escape(row["set"])
-                                + (f"$^{BEST_MARK}$" if row["loop_stat"] == "best" else "")
-                                for row in rows]) + r" \\",
-             r"\midrule"]
-    for _, title, key, spec in TABLE:
-        cells = [latex_escape(cell(row, key, spec)).replace(",", "\\,") for row in rows]
-        lines.append(" & ".join([title] + cells) + r" \\")
-    lines.append(r"\bottomrule")
-    if any(row["loop_stat"] == "best" for row in rows):
-        lines.append(rf"\multicolumn{{{len(rows) + 1}}}{{l}}{{\footnotesize ${BEST_MARK}$ loop "
-                     r"times: fastest of the repeats at each thread count, not their median.} \\")
-    lines.append(r"\end{tabular}")
-    with open(path, "w") as f:
-        f.write("\n".join(lines) + "\n")
-
-
-def plot(sets, tests, path, best=(), sizes_tb=()):
+def plot(sets, tests, path, sizes_tb=(), fits=None):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     fig, (ax_t, ax_s, ax_m) = plt.subplots(1, 3, figsize=(15, 4.6))
     ticks = sorted({p["threads"] for points in sets.values() for p in points})
-    for (name, points), base in zip(sets.items(), STYLES * len(sets)):
-        style = dict(base, ls="-")
+    for index, (name, points) in enumerate(sets.items()):
+        style = dict(style_of(name, index), ls="-")
         xs = [p["threads"] for p in points]
-        timed = name + (" (fastest of repeats)" if name in best else "")
         ax_t.errorbar(xs, [p["loop"] for p in points],
                       yerr=[[p["loop"] - p["loop_lo"] for p in points],
                             [p["loop_hi"] - p["loop"] for p in points]],
-                      capsize=3, label=timed, **style)
+                      capsize=3, label=name, **style)
         if points[0]["threads"] == 1:
-            ax_s.plot(xs, [points[0]["loop"] / p["loop"] for p in points], label=timed, **style)
+            ax_s.plot(xs, [points[0]["loop"] / p["loop"] for p in points], label=name, **style)
+        if name in (fits or {}):
+            ns = range(1, ticks[-1] + 1)
+            ax_s.plot(ns, [amdahl(n, fits[name]) for n in ns], ls=":", lw=1.5,
+                      color=style["color"], label=f"Amdahl, s = {fits[name]:.4f}")
         with_rss = [p for p in points if p["rss_gb"]]
         if with_rss:
             ax_m.errorbar([p["threads"] for p in with_rss], [p["rss_gb"] for p in with_rss],
                           yerr=[[p["rss_gb"] - p["rss_lo"] for p in with_rss],
                                 [p["rss_hi"] - p["rss_gb"] for p in with_rss]],
                           capsize=3, label=name, **style)
-    ax_s.plot(ticks, ticks, ls="--", color="grey", lw=0.8, label="ideal")
-    labelled = [t for t in ticks if t in LABELLED]
-    for ax in (ax_t, ax_s):
-        ax.set_xscale("log", base=2)
-        ax.set_xticks(labelled)
-        ax.set_xticklabels([str(t) for t in labelled])
-        ax.minorticks_off()
-    ax_m.set_xlim(0, ticks[-1] * 1.04)
+    ax_s.plot([0, ticks[-1]], [0, ticks[-1]], ls="--", color="grey", lw=0.8, label="ideal")
     for ax in (ax_t, ax_s, ax_m):
+        ax.set_xlim(0, ticks[-1] * 1.04)
+        ax.set_xticks(THREAD_TICKS)
         ax.set_xlabel("threads")
         ax.grid(alpha=0.3, which="both")
         ax.legend(fontsize=8)
     ax_t.set_yscale("log")
-    ax_s.set_yscale("log", base=2)
-    ax_s.set_yticks(labelled)
-    ax_s.set_yticklabels([str(t) for t in labelled])
+    ax_s.set_ylim(0, ticks[-1] * 1.04)
+    ax_s.set_yticks(THREAD_TICKS)
     ax_t.set_ylabel("event-loop time [s]")
     ax_s.set_ylabel("speedup against 1 thread")
     ax_m.set_ylabel("peak RSS [GB]")
     ax_t.set_title("event loop")
-    ax_s.set_title("strong scaling")
+    ax_s.set_title("speedup")
     ax_m.set_title("memory")
     chain = {"chain11": "11-filter chain (10 branches)", "chain": "5-filter chain (4 branches)"}
     title = " / ".join(chain.get(t, t) for t in sorted(set(tests)))
     if sizes_tb:
-        title += f", {min(sizes_tb):.1f}-{max(sizes_tb):.1f} TB per set"
+        low, high = min(sizes_tb), max(sizes_tb)
+        title += f", {high:.1f} TB" if f"{low:.1f}" == f"{high:.1f}" else f", {low:.1f}-{high:.1f} TB per set"
     fig.suptitle(title)
     fig.tight_layout()
     fig.savefig(path, dpi=140)
@@ -294,52 +345,61 @@ def main():
                         metavar="DIR:TEST:LABEL", help="a results directory (repeatable)")
     parser.add_argument("--figure", action="append", default=[], metavar="LABEL",
                         help="a set to draw (repeatable; default: every set)")
-    parser.add_argument("--best-of", action="append", default=[], metavar="LABEL",
-                        help="a set timed by the fastest of its repeats (repeatable)")
-    parser.add_argument("--out", default=".", help="directory for the figure and the tables")
+    parser.add_argument("--amdahl", action="store_true",
+                        help="fit and draw Amdahl's law for every strong curve")
+    parser.add_argument("--out", default=".", help="directory for the figure and the table")
     args = parser.parse_args()
 
     labels = [label for _, _, label in args.sets]
-    for option, given in (("--figure", args.figure), ("--best-of", args.best_of)):
-        unknown = [label for label in given if label not in labels]
-        if unknown:
-            print(f"ERROR: {option} {', '.join(unknown)} is not the label of any --set",
-                  file=sys.stderr)
-            return 1
+    unknown = [label for label in args.figure if label not in labels]
+    if unknown:
+        print(f"ERROR: --figure {', '.join(unknown)} is not the label of any --set",
+              file=sys.stderr)
+        return 1
 
     sets, tests, rows = {}, {}, []
     for results_dir, test, label in args.sets:
-        best = label in args.best_of
-        points = sweep(results_dir, test, best) if os.path.isdir(results_dir) else []
+        points = sweep(results_dir, test) if os.path.isdir(results_dir) else []
         if not points:
             print(f"WARNING: skipping '{label}': no {test} strong sweep (r<N>_strong_*) in "
                   f"{results_dir}", file=sys.stderr)
             continue
         sets[label], tests[label] = points, test
-        rows.append(summarise(label, test, points, dataset_info(results_dir), best))
+        rows.append(summarise(label, test, points, dataset_info(results_dir)))
     if not rows:
         print("ERROR: no set with a strong sweep", file=sys.stderr)
         return 1
 
     print_table(rows)
     os.makedirs(args.out, exist_ok=True)
-    for name, writer in (("sets_summary.csv", write_csv), ("sets_summary.tex", write_tex)):
-        path = os.path.join(args.out, name)
-        writer(rows, path)
-        print(f"  {path}")
+    csv_path = os.path.join(args.out, "sets_summary.csv")
+    write_csv(rows, csv_path)
+    print(f"  {csv_path}")
 
     drawn = {label: sets[label] for label in (args.figure or labels) if label in sets}
+    fits = {}
+    for label, points in drawn.items():
+        if not args.amdahl or points[0]["threads"] != 1:
+            continue
+        fits[label] = fit_amdahl(points)
+        print(f"  Amdahl {label}: s = {fits[label]:.5f}, 1/s = {1 / fits[label]:.0f}, "
+              f"s T(1) = {fits[label] * points[0]['loop']:.1f} s")
+        loops = {p["threads"]: p["loop"] for p in points}
+        for n, e in karp_flatt(points):
+            measured = points[0]["loop"] / loops[n]
+            print(f"    N = {n:4d}  S = {measured:6.1f}  Amdahl = {amdahl(n, fits[label]):6.1f}"
+                  f"  Karp-Flatt e = {e:.5f}")
     if not drawn:
         print("no set of --figure has results yet -- figure skipped", file=sys.stderr)
         return 0
     try:
         import matplotlib  # noqa: F401
     except ImportError:
-        print("matplotlib not installed -- tables written, figure skipped", file=sys.stderr)
+        print("matplotlib not installed -- table written, figure skipped", file=sys.stderr)
         return 0
     png_path = os.path.join(args.out, "full_files_chain11.png")
     sizes_tb = [row["input_tb"] for row in rows if row["set"] in drawn and row["input_tb"]]
-    plot(drawn, [tests[label] for label in drawn], png_path, set(args.best_of), sizes_tb)
+    plot(drawn, [tests[label] for label in drawn], png_path, sizes_tb, fits)
     print(f"  {png_path}")
     return 0
 
